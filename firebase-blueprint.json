@@ -1,0 +1,63 @@
+{
+  "entities": {
+    "Member": {
+      "title": "Member",
+      "description": "A gym member",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The name of the member" },
+        "phone": { "type": "string", "description": "The phone number of the member (Indian format: 91 followed by 10 digits)" },
+        "join_date": { "type": "string", "format": "date", "description": "The date the member joined" },
+        "plan": { "type": "string", "enum": ["monthly", "quarterly", "yearly"], "description": "The membership plan" },
+        "fee_amount": { "type": "number", "description": "The fee amount for the plan" },
+        "status": { "type": "string", "enum": ["active", "inactive"], "description": "The status of the membership" }
+      },
+      "required": ["name", "phone", "join_date", "plan", "fee_amount"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "A payment record for a member",
+      "type": "object",
+      "properties": {
+        "member_id": { "type": "string", "description": "The ID of the member" },
+        "amount": { "type": "number", "description": "The payment amount" },
+        "payment_date": { "type": "string", "format": "date", "description": "The date the payment was made" },
+        "due_date": { "type": "string", "format": "date", "description": "The date the payment is due" },
+        "status": { "type": "string", "enum": ["paid", "pending"], "description": "The status of the payment" },
+        "last_reminder_date": { "type": "string", "format": "date", "description": "The date the last reminder was sent" }
+      },
+      "required": ["member_id", "amount", "due_date", "status"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Application settings",
+      "type": "object",
+      "properties": {
+        "reminder_days_before": { "type": "string" },
+        "overdue_reminder_frequency": { "type": "string" },
+        "upcoming_message": { "type": "string" },
+        "overdue_message": { "type": "string" }
+      }
+    },
+    "AutomationLog": {
+      "title": "AutomationLog",
+      "description": "Log of automated reminder actions",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["upcoming_reminder", "overdue_reminder"] },
+        "member_id": { "type": "string" },
+        "member_name": { "type": "string" },
+        "phone": { "type": "string" },
+        "message": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "status": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "members": { "schema": "Member", "description": "Collection of gym members" },
+    "payments": { "schema": "Payment", "description": "Collection of payment records" },
+    "settings": { "schema": "Settings", "description": "Collection for application settings" },
+    "automation_logs": { "schema": "AutomationLog", "description": "Collection of automation logs" }
+  }
+}

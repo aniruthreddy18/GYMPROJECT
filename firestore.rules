@@ -1,0 +1,125 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: members
+    // Fields:
+    //   - name: string (required, 1-100 chars)
+    //   - phone: string (required, 10-15 chars)
+    //   - join_date: string (required, ISO 8601)
+    //   - plan: string (required, enum: monthly, quarterly, yearly)
+    //   - fee_amount: number (required, positive)
+    //   - status: string (required, enum: active, inactive)
+    //
+    // Collection: payments
+    // Fields:
+    //   - member_id: string (required, reference to members)
+    //   - amount: number (required, positive)
+    //   - payment_date: string (optional, ISO 8601)
+    //   - due_date: string (required, ISO 8601)
+    //   - status: string (required, enum: paid, pending)
+    //   - last_reminder_date: string (optional, ISO 8601)
+    //
+    // Collection: settings
+    // Fields:
+    //   - reminder_days_before: string
+    //   - overdue_reminder_frequency: string
+    //   - upcoming_message: string
+    //   - overdue_message: string
+    //
+    // Collection: users (for roles)
+    // Fields:
+    //   - role: string (admin, staff)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        ((exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+         (request.auth.token.email == "aniruthreddylucky@gmail.com") ||
+         (request.auth.token.email == "aniruthcreator26@gmail.com"));
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidDateString(dateStr) {
+      return dateStr is string && dateStr.matches("^\\d{4}-\\d{2}-\\d{2}.*");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidMember(data) {
+      return data.keys().hasAll(['name', 'phone', 'join_date', 'plan', 'fee_amount', 'status']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.phone is string && data.phone.matches("^91\\d{10}$") &&
+             isValidDateString(data.join_date) &&
+             data.plan in ['monthly', 'quarterly', 'yearly'] &&
+             data.fee_amount is number && data.fee_amount >= 0 &&
+             data.status in ['active', 'inactive'] &&
+             data.keys().hasOnly(['name', 'phone', 'join_date', 'plan', 'fee_amount', 'status', 'status_history']);
+    }
+
+    function isValidPayment(data) {
+      return data.keys().hasAll(['member_id', 'amount', 'due_date', 'status']) &&
+             data.member_id is string &&
+             data.amount is number && data.amount >= 0 &&
+             isValidDateString(data.due_date) &&
+             data.status in ['paid', 'pending'] &&
+             (!('payment_date' in data) || isValidDateString(data.payment_date)) &&
+             (!('last_reminder_date' in data) || isValidDateString(data.last_reminder_date)) &&
+             data.keys().hasOnly(['member_id', 'amount', 'payment_date', 'due_date', 'status', 'last_reminder_date']);
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasOnly(['reminder_days_before', 'overdue_reminder_frequency', 'upcoming_message', 'overdue_message']);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /members/{memberId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidMember(request.resource.data);
+      allow update: if isAdmin() && isValidMember(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /payments/{paymentId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidPayment(request.resource.data);
+      allow update: if isAdmin() && isValidPayment(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin() && isValidSettings(request.resource.data);
+    }
+
+    match /automation_logs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+  }
+}

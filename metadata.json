@@ -1,0 +1,5 @@
+{
+  "name": "GymFlow Automation",
+  "description": "Automated gym membership and payment tracking system with scheduled reminders.",
+  "requestFramePermissions": []
+}
