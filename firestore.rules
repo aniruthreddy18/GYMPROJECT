@@ -44,11 +44,7 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isAuthenticated() &&
-        ((exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
-         (request.auth.token.email == "aniruthreddylucky@gmail.com") ||
-         (request.auth.token.email == "aniruthcreator26@gmail.com"));
+      return isAuthenticated();
     }
 
     function isValidEmail(email) {
@@ -71,6 +67,7 @@ service cloud.firestore {
              data.plan in ['monthly', 'quarterly', 'yearly'] &&
              data.fee_amount is number && data.fee_amount >= 0 &&
              data.status in ['active', 'inactive'] &&
+             (!('status_history' in data) || (data.status_history is list && data.status_history.size() <= 100)) &&
              data.keys().hasOnly(['name', 'phone', 'join_date', 'plan', 'fee_amount', 'status', 'status_history']);
     }
 
@@ -86,7 +83,12 @@ service cloud.firestore {
     }
 
     function isValidSettings(data) {
-      return data.keys().hasOnly(['reminder_days_before', 'overdue_reminder_frequency', 'upcoming_message', 'overdue_message']);
+      return data.keys().hasOnly(['reminder_days_before', 'overdue_reminder_frequency', 'upcoming_message', 'overdue_message', 'whatsapp_webhook_url']) &&
+             (!('reminder_days_before' in data) || (data.reminder_days_before is string && data.reminder_days_before.size() <= 2)) &&
+             (!('overdue_reminder_frequency' in data) || (data.overdue_reminder_frequency is string && data.overdue_reminder_frequency.size() <= 2)) &&
+             (!('upcoming_message' in data) || (data.upcoming_message is string && data.upcoming_message.size() <= 1000)) &&
+             (!('overdue_message' in data) || (data.overdue_message is string && data.overdue_message.size() <= 1000)) &&
+             (!('whatsapp_webhook_url' in data) || (data.whatsapp_webhook_url is string && data.whatsapp_webhook_url.size() <= 500));
     }
 
     // ===============================================================
@@ -94,32 +96,29 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
-      allow write: if isAdmin();
-    }
+      allow read, write: if request.auth != null && request.auth.uid == userId;
 
-    match /members/{memberId} {
-      allow read: if isAdmin();
-      allow create: if isAdmin() && isValidMember(request.resource.data);
-      allow update: if isAdmin() && isValidMember(request.resource.data);
-      allow delete: if isAdmin();
-    }
+      match /members/{memberId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create, update: if request.auth != null && request.auth.uid == userId && isValidMember(request.resource.data);
+        allow delete: if request.auth != null && request.auth.uid == userId;
+      }
 
-    match /payments/{paymentId} {
-      allow read: if isAdmin();
-      allow create: if isAdmin() && isValidPayment(request.resource.data);
-      allow update: if isAdmin() && isValidPayment(request.resource.data);
-      allow delete: if isAdmin();
-    }
+      match /payments/{paymentId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create, update: if request.auth != null && request.auth.uid == userId && isValidPayment(request.resource.data);
+        allow delete: if request.auth != null && request.auth.uid == userId;
+      }
 
-    match /settings/{settingId} {
-      allow read: if isAdmin();
-      allow write: if isAdmin() && isValidSettings(request.resource.data);
-    }
+      match /settings/{settingId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow write: if request.auth != null && request.auth.uid == userId && isValidSettings(request.resource.data);
+      }
 
-    match /automation_logs/{logId} {
-      allow read: if isAdmin();
-      allow write: if false;
+      match /automation_logs/{logId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow write: if false;
+      }
     }
   }
 }

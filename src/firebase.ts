@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, query, where, onSnapshot, orderBy, limit, writeBatch, getDocFromServer } from 'firebase/firestore';
+import { getFirestore, collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, query, where, onSnapshot, orderBy, limit, writeBatch, getDocFromServer, getCountFromServer, startAfter, limitToLast } from 'firebase/firestore';
 
 // Import the Firebase configuration
 import firebaseConfig from '../firebase-applet-config.json';
@@ -77,6 +77,7 @@ testConnection();
 
 export { 
   collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, 
-  query, where, onSnapshot, orderBy, limit, writeBatch,
+  query, where, onSnapshot, orderBy, limit, writeBatch, getCountFromServer,
+  startAfter, limitToLast,
   signInWithPopup, onAuthStateChanged, type User
 };

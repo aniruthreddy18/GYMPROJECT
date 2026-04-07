@@ -55,9 +55,10 @@
     }
   },
   "firestore": {
-    "members": { "schema": "Member", "description": "Collection of gym members" },
-    "payments": { "schema": "Payment", "description": "Collection of payment records" },
-    "settings": { "schema": "Settings", "description": "Collection for application settings" },
-    "automation_logs": { "schema": "AutomationLog", "description": "Collection of automation logs" }
+    "users/{userId}": { "schema": "object", "description": "User profile document" },
+    "users/{userId}/members": { "schema": "Member", "description": "User's collection of gym members" },
+    "users/{userId}/payments": { "schema": "Payment", "description": "User's collection of payment records" },
+    "users/{userId}/settings": { "schema": "Settings", "description": "User's collection for application settings" },
+    "users/{userId}/automation_logs": { "schema": "AutomationLog", "description": "User's collection of automation logs" }
   }
 }

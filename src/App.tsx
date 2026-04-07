@@ -20,15 +20,20 @@ import {
   Edit2,
   ChevronUp,
   ChevronDown,
-  CheckCircle2
+  CheckCircle2,
+  X,
+  AlertTriangle,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, parseISO, addMonths, startOfMonth, endOfMonth, addDays } from 'date-fns';
 import { 
   auth, db, googleProvider, signInWithPopup, onAuthStateChanged, 
   collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, 
-  query, where, onSnapshot, orderBy, limit, writeBatch, handleFirestoreError, OperationType, type User
+  query, where, onSnapshot, orderBy, limit, writeBatch, handleFirestoreError, OperationType, getCountFromServer, startAfter, limitToLast, type User
 } from './firebase';
+
+import { QRCodeSVG } from 'qrcode.react';
 
 // --- Types ---
 interface StatusChange {
@@ -56,6 +61,7 @@ interface Payment {
   due_date: string;
   status: string;
   last_reminder_date?: string | null;
+  method?: string;
 }
 
 interface DashboardStats {
@@ -81,6 +87,8 @@ interface AppSettings {
   overdue_reminder_frequency: string;
   upcoming_message: string;
   overdue_message: string;
+  whatsapp_webhook_url?: string;
+  upi_id?: string;
 }
 
 // --- Components ---
@@ -189,11 +197,30 @@ function AppContent() {
   const [isRunningAutomation, setIsRunningAutomation] = useState(false);
   const [isSeedingData, setIsSeedingData] = useState(false);
   const [paymentStatusFilter, setPaymentStatusFilter] = useState<'all' | 'paid' | 'pending'>('all');
+  const [notification, setNotification] = useState<{ message: string, type: 'success' | 'error' | 'info' } | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ title: string, message: string, onConfirm: () => void } | null>(null);
+
+  // Pagination State
+  const [membersPage, setMembersPage] = useState(1);
+  const [paymentsPage, setPaymentsPage] = useState(1);
+  const [membersPageSize] = useState(10);
+  const [paymentsPageSize] = useState(10);
+  const [totalMembersCount, setTotalMembersCount] = useState(0);
+  const [totalPaymentsCount, setTotalPaymentsCount] = useState(0);
+  const [membersCursors, setMembersCursors] = useState<any[]>([null]);
+  const [paymentsCursors, setPaymentsCursors] = useState<any[]>([null]);
+  const [memberNames, setMemberNames] = useState<Record<string, string>>({});
+
+  const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
 
   const isValidIndianPhone = (phone: string) => /^91\d{10}$/.test(phone);
   const [selectedPayments, setSelectedPayments] = useState<string[]>([]);
   const [sortField, setSortField] = useState<'due_date' | 'amount' | 'status' | 'name'>('due_date');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+  const [paymentModal, setPaymentModal] = useState<{ isOpen: boolean, payment: Payment | null }>({ isOpen: false, payment: null });
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
@@ -206,15 +233,12 @@ function AppContent() {
           const userRef = doc(db, 'users', user.uid);
           const userSnap = await getDoc(userRef);
           if (!userSnap.exists()) {
-            // Check if they are a hardcoded admin
-            const admins = ["aniruthreddylucky@gmail.com", "aniruthcreator26@gmail.com"];
-            if (admins.includes(user.email || '')) {
-              await setDoc(userRef, {
-                role: 'admin',
-                email: user.email,
-                displayName: user.displayName
-              });
-            }
+            await setDoc(userRef, {
+              role: 'admin',
+              email: user.email,
+              displayName: user.displayName,
+              createdAt: new Date().toISOString()
+            });
           }
         } catch (err) {
           console.error("Error initializing user document:", err);
@@ -230,33 +254,163 @@ function AppContent() {
     if (!isAuthReady || !user) return;
     
     const unsubLogs = onSnapshot(
-      query(collection(db, 'automation_logs'), orderBy('timestamp', 'desc'), limit(10)),
+      query(collection(db, 'users', user.uid, 'automation_logs'), orderBy('timestamp', 'desc'), limit(10)),
       (snapshot) => {
         const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as AutomationLog));
         setAutomationLogs(logs);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'automation_logs')
+      (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/automation_logs`)
     );
     
     return () => unsubLogs();
   }, [isAuthReady, user]);
 
+  // Fetch Counts and Stats
   useEffect(() => {
     if (!isAuthReady || !user) return;
 
-    const unsubMembers = onSnapshot(collection(db, 'members'), (snapshot) => {
+    const fetchCounts = async () => {
+      try {
+        const membersColl = collection(db, 'users', user.uid, 'members');
+        const paymentsColl = collection(db, 'users', user.uid, 'payments');
+        
+        const membersCountSnap = await getCountFromServer(membersColl);
+        setTotalMembersCount(membersCountSnap.data().count);
+
+        const paymentsCountSnap = await getCountFromServer(paymentsColl);
+        setTotalPaymentsCount(paymentsCountSnap.data().count);
+
+        // Fetch current month payments for accurate dashboard stats
+        const now = new Date();
+        const start = startOfMonth(now).toISOString().split('T')[0];
+        const end = endOfMonth(now).toISOString().split('T')[0];
+        
+        // 1. Fetch ALL pending payments to include overdue ones from previous months
+        const pendingQuery = query(paymentsColl, where('status', '==', 'pending'));
+        const pendingSnap = await getDocs(pendingQuery);
+        const allPending = pendingSnap.docs.map(d => ({ id: d.id, ...d.data() } as Payment));
+        
+        // 2. Fetch paid payments for THIS month for revenue and paid count
+        // We use payment_date to track when money actually came in
+        const paidQuery = query(
+          paymentsColl, 
+          where('status', '==', 'paid'),
+          where('payment_date', '>=', start),
+          where('payment_date', '<=', end)
+        );
+        
+        let paidPayments: Payment[] = [];
+        try {
+          const paidSnap = await getDocs(paidQuery);
+          paidPayments = paidSnap.docs.map(d => ({ id: d.id, ...d.data() } as Payment));
+        } catch (indexError) {
+          // Fallback if index is missing: fetch all paid and filter
+          console.warn("Paid query failed, falling back to client-side filter.");
+          const fallbackQuery = query(paymentsColl, where('status', '==', 'paid'));
+          const fallbackSnap = await getDocs(fallbackQuery);
+          paidPayments = fallbackSnap.docs
+            .map(d => ({ id: d.id, ...d.data() } as Payment))
+            .filter(p => p.payment_date && p.payment_date >= start && p.payment_date <= end);
+        }
+        
+        const revenue = paidPayments.reduce((acc, p) => acc + p.amount, 0);
+
+        // Sort pending by due date (oldest first)
+        const sortedPending = allPending
+          .sort((a, b) => parseISO(a.due_date).getTime() - parseISO(b.due_date).getTime());
+        
+        const recentPendingRaw = sortedPending.slice(0, 10); // Show up to 10 on dashboard
+        
+        const recentPendingWithNames = await Promise.all(recentPendingRaw.map(async (p) => {
+          try {
+            const mSnap = await getDoc(doc(db, 'users', user.uid, 'members', p.member_id));
+            if (mSnap.exists()) {
+              const mData = mSnap.data();
+              return { ...p, name: mData.name, phone: mData.phone };
+            }
+          } catch (e) {
+            console.error("Error fetching member for recent pending:", e);
+          }
+          return { ...p, name: 'Unknown', phone: '' };
+        }));
+        
+        setStats({
+          totalMembers: membersCountSnap.data().count,
+          pendingCount: allPending.length,
+          paidCount: paidPayments.length,
+          monthlyRevenue: revenue,
+          recentPending: recentPendingWithNames
+        });
+
+      } catch (err) {
+        console.error("Error fetching counts:", err);
+      }
+    };
+
+    fetchCounts();
+    // Refresh counts every 5 minutes or on demand
+    const interval = setInterval(fetchCounts, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [isAuthReady, user]);
+
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+
+    const membersColl = collection(db, 'users', user.uid, 'members');
+    let q = query(membersColl, orderBy('name'), limit(membersPageSize));
+    
+    if (membersPage > 1 && membersCursors[membersPage - 1]) {
+      q = query(membersColl, orderBy('name'), startAfter(membersCursors[membersPage - 1]), limit(membersPageSize));
+    }
+
+    const unsubMembers = onSnapshot(q, (snapshot) => {
       const membersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Member));
       setMembers(membersData);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'members'));
+      
+      // Update names cache
+      setMemberNames(prev => {
+        const next = { ...prev };
+        membersData.forEach(m => {
+          next[m.id] = m.name;
+        });
+        return next;
+      });
+      
+      // Update cursor for next page if we are on the current page
+      if (snapshot.docs.length > 0) {
+        const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+        setMembersCursors(prev => {
+          const next = [...prev];
+          next[membersPage] = lastDoc;
+          return next;
+        });
+      }
+    }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/members`));
 
-    // Listen to Payments
-    const unsubPayments = onSnapshot(collection(db, 'payments'), (snapshot) => {
+    // Listen to Payments (Paginated)
+    const paymentsColl = collection(db, 'users', user.uid, 'payments');
+    let pq = query(paymentsColl, orderBy('due_date', 'desc'), limit(paymentsPageSize));
+
+    if (paymentsPage > 1 && paymentsCursors[paymentsPage - 1]) {
+      pq = query(paymentsColl, orderBy('due_date', 'desc'), startAfter(paymentsCursors[paymentsPage - 1]), limit(paymentsPageSize));
+    }
+
+    const unsubPayments = onSnapshot(pq, (snapshot) => {
       const paymentsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
       setPayments(paymentsData);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'payments'));
+
+      if (snapshot.docs.length > 0) {
+        const lastDoc = snapshot.docs[snapshot.docs.length - 1];
+        setPaymentsCursors(prev => {
+          const next = [...prev];
+          next[paymentsPage] = lastDoc;
+          return next;
+        });
+      }
+    }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/payments`));
 
     // Listen to Settings
-    const unsubSettings = onSnapshot(doc(db, 'settings', 'config'), (docSnap) => {
+    const unsubSettings = onSnapshot(doc(db, 'users', user.uid, 'settings', 'config'), (docSnap) => {
       if (docSnap.exists()) {
         setSettings(docSnap.data() as AppSettings);
       } else {
@@ -265,80 +419,60 @@ function AppContent() {
           reminder_days_before: '2',
           overdue_reminder_frequency: '2',
           upcoming_message: 'the payment for the next month is in next {days} days try to pay as soon as possible',
-          overdue_message: 'payment of gym fees is pending pay as soon as possible'
+          overdue_message: 'payment of gym fees is pending pay as soon as possible',
+          whatsapp_webhook_url: ''
         };
-        setDoc(doc(db, 'settings', 'config'), defaultSettings);
+        setDoc(doc(db, 'users', user.uid, 'settings', 'config'), defaultSettings);
         setSettings(defaultSettings);
       }
-    }, (err) => handleFirestoreError(err, OperationType.GET, 'settings/config'));
+    }, (err) => handleFirestoreError(err, OperationType.GET, `users/${user.uid}/settings/config`));
 
     return () => {
       unsubMembers();
       unsubPayments();
       unsubSettings();
     };
-  }, [isAuthReady, user]);
-
-  useEffect(() => {
-    if (!members.length && !payments.length) {
-      setStats({
-        totalMembers: 0,
-        pendingCount: 0,
-        paidCount: 0,
-        monthlyRevenue: 0,
-        recentPending: []
-      });
-      return;
-    }
-
-    const now = new Date();
-    const start = startOfMonth(now);
-    const end = endOfMonth(now);
-
-    const activeMembers = members.filter(m => m.status === 'active');
-    
-    // Payments for stats (this month)
-    const thisMonthPayments = payments.filter(p => {
-      if (p.status === 'paid' && p.payment_date) {
-        const pDate = parseISO(p.payment_date);
-        return pDate >= start && pDate <= end;
-      }
-      return false;
-    });
-
-    const pendingPayments = payments.filter(p => {
-      if (p.status === 'pending') {
-        const dDate = parseISO(p.due_date);
-        return dDate >= start && dDate <= end;
-      }
-      return false;
-    });
-
-    const revenue = thisMonthPayments.reduce((acc, p) => acc + p.amount, 0);
-
-    const recentPending = pendingPayments
-      .sort((a, b) => parseISO(a.due_date).getTime() - parseISO(b.due_date).getTime())
-      .slice(0, 5)
-      .map(p => {
-        const member = members.find(m => m.id === p.member_id);
-        return { ...p, name: member?.name || 'Unknown', phone: member?.phone || '' };
-      });
-
-    setStats({
-      totalMembers: activeMembers.length,
-      pendingCount: pendingPayments.length,
-      paidCount: thisMonthPayments.length,
-      monthlyRevenue: revenue,
-      recentPending
-    });
-  }, [members, payments]);
+  }, [isAuthReady, user, membersPage, paymentsPage]);
 
   const enrichedPayments = useMemo(() => {
     return payments.map(p => {
       const member = members.find(m => m.id === p.member_id);
-      return { ...p, name: member?.name || 'Unknown' };
+      return { ...p, name: member?.name || memberNames[p.member_id] || 'Loading...' };
     });
-  }, [payments, members]);
+  }, [payments, members, memberNames]);
+
+  // Effect to fetch missing member names for payments
+  useEffect(() => {
+    if (!isAuthReady || !user || !payments.length) return;
+
+    const fetchMissingNames = async () => {
+      const missingIds = payments
+        .map(p => p.member_id)
+        .filter(id => !memberNames[id]);
+      
+      if (missingIds.length === 0) return;
+
+      const uniqueMissing = Array.from(new Set(missingIds)) as string[];
+      const newNames: Record<string, string> = {};
+
+      await Promise.all(uniqueMissing.map(async (id: string) => {
+        try {
+          const mSnap = await getDoc(doc(db, 'users', user.uid, 'members', id));
+          if (mSnap.exists()) {
+            newNames[id] = mSnap.data().name;
+          }
+        } catch (e) {
+          console.error("Error fetching missing member name:", e);
+        }
+      }));
+
+      if (Object.keys(newNames).length > 0) {
+        setMemberNames(prev => ({ ...prev, ...newNames }));
+      }
+    };
+
+    fetchMissingNames();
+  }, [payments, isAuthReady, user]);
 
   const filteredPayments = useMemo(() => {
     const today = new Date();
@@ -351,8 +485,13 @@ function AppContent() {
       
       const dueDate = parseISO(p.due_date);
       
-      // Only show payments due in the current month
-      return dueDate >= start && dueDate <= end;
+      // If it's pending, show it regardless of date (to include overdue)
+      if (p.status === 'pending') return true;
+      
+      // If it's paid, only show it if it was paid this month or due this month
+      // This keeps the list manageable
+      return (dueDate >= start && dueDate <= end) || 
+             (p.payment_date && parseISO(p.payment_date) >= start && parseISO(p.payment_date) <= end);
     });
     
     return filtered.sort((a, b) => {
@@ -390,14 +529,43 @@ function AppContent() {
     fee_amount: 1000
   });
 
+  const handleNextMembers = () => {
+    if (members.length === membersPageSize) {
+      setMembersPage(prev => prev + 1);
+    }
+  };
+
+  const handlePrevMembers = () => {
+    setMembersPage(prev => Math.max(1, prev - 1));
+  };
+
+  const handleNextPayments = () => {
+    if (payments.length === paymentsPageSize) {
+      setPaymentsPage(prev => prev + 1);
+    }
+  };
+
+  const handlePrevPayments = () => {
+    setPaymentsPage(prev => Math.max(1, prev - 1));
+  };
+
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isValidIndianPhone(newMember.phone)) {
-      alert("Please enter a valid Indian phone number starting with 91 followed by 10 digits (e.g., 919876543210)");
+      showNotification("Please enter a valid Indian phone number starting with 91 followed by 10 digits (e.g., 919876543210)", 'error');
       return;
     }
+    if (!user) return;
+
+    // Check for duplicate phone number
+    const duplicate = members.find(m => m.phone === newMember.phone);
+    if (duplicate) {
+      showNotification(`A member with phone number ${newMember.phone} already exists (${duplicate.name})`, 'error');
+      return;
+    }
+
     try {
-      const memberRef = doc(collection(db, 'members'));
+      const memberRef = doc(collection(db, 'users', user.uid, 'members'));
       const memberId = memberRef.id;
       const memberData = { 
         ...newMember, 
@@ -408,7 +576,7 @@ function AppContent() {
       await setDoc(memberRef, memberData);
 
       // 1. Mark initial payment as PAID (Joining Month)
-      const initialPaymentRef = doc(collection(db, 'payments'));
+      const initialPaymentRef = doc(collection(db, 'users', user.uid, 'payments'));
       await setDoc(initialPaymentRef, {
         member_id: memberId,
         amount: newMember.fee_amount,
@@ -423,7 +591,7 @@ function AppContent() {
       if (newMember.plan === 'yearly') monthsToAdd = 12;
       
       const nextDueDate = format(addMonths(parseISO(newMember.join_date), monthsToAdd), 'yyyy-MM-dd');
-      const nextPaymentRef = doc(collection(db, 'payments'));
+      const nextPaymentRef = doc(collection(db, 'users', user.uid, 'payments'));
       await setDoc(nextPaymentRef, {
         member_id: memberId,
         amount: newMember.fee_amount,
@@ -449,7 +617,16 @@ function AppContent() {
     if (!editingMember) return;
     
     if (!isValidIndianPhone(editingMember.phone)) {
-      alert("Please enter a valid Indian phone number starting with 91 followed by 10 digits (e.g., 919876543210)");
+      showNotification("Please enter a valid Indian phone number starting with 91 followed by 10 digits (e.g., 919876543210)", 'error');
+      return;
+    }
+
+    if (!user) return;
+    
+    // Check for duplicate phone number (excluding self)
+    const duplicate = members.find(m => m.phone === editingMember.phone && m.id !== editingMember.id);
+    if (duplicate) {
+      showNotification(`Another member with phone number ${editingMember.phone} already exists (${duplicate.name})`, 'error');
       return;
     }
 
@@ -465,11 +642,11 @@ function AppContent() {
         data.status_history = newHistory;
       }
 
-      await updateDoc(doc(db, 'members', id), data);
+      await updateDoc(doc(db, 'users', user.uid, 'members', id), data);
       setIsEditingMember(false);
       setEditingMember(null);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `members/${editingMember.id}`);
+      handleFirestoreError(err, OperationType.UPDATE, `users/${user.uid}/members/${editingMember.id}`);
     }
   };
 
@@ -486,10 +663,11 @@ function AppContent() {
     window.open(whatsappUrl, '_blank');
   };
 
-  const handleMarkPaid = async (id: string) => {
+  const handleMarkPaid = async (id: string, method: string = 'cash') => {
+    if (!user) return;
     try {
       const paymentDate = format(new Date(), 'yyyy-MM-dd');
-      const paymentRef = doc(db, 'payments', id);
+      const paymentRef = doc(db, 'users', user.uid, 'payments', id);
       const paymentSnap = await getDoc(paymentRef);
       
       if (!paymentSnap.exists()) return;
@@ -497,10 +675,11 @@ function AppContent() {
       
       await updateDoc(paymentRef, {
         status: 'paid',
-        payment_date: paymentDate
+        payment_date: paymentDate,
+        method: method
       });
       
-      const memberSnap = await getDoc(doc(db, 'members', paymentData.member_id));
+      const memberSnap = await getDoc(doc(db, 'users', user.uid, 'members', paymentData.member_id));
       if (!memberSnap.exists()) return;
       const memberData = memberSnap.data() as any;
       
@@ -509,137 +688,286 @@ function AppContent() {
       if (memberData.plan === 'yearly') monthsToAdd = 12;
       
       const nextDueDate = format(addMonths(parseISO(paymentData.due_date), monthsToAdd), 'yyyy-MM-dd');
-      await setDoc(doc(collection(db, 'payments')), {
+      await setDoc(doc(collection(db, 'users', user.uid, 'payments')), {
         member_id: memberData.id || memberSnap.id,
         amount: memberData.fee_amount,
         due_date: nextDueDate,
         status: 'pending'
       });
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `payments/${id}`);
+      handleFirestoreError(err, OperationType.UPDATE, `users/${user.uid}/payments/${id}`);
     }
   };
 
   const handleRunAutomation = async () => {
+    if (!user) return;
     setIsRunningAutomation(true);
     try {
-      const response = await fetch('/api/trigger-reminders', { method: 'POST' });
+      const response = await fetch('/api/trigger-reminders', { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.uid })
+      });
       const data = await response.json();
       if (data.success) {
-        alert(`Automation completed! Processed ${data.processedCount} reminders.`);
+        showNotification(`Automation completed! Processed ${data.processedCount} reminders.`, 'success');
       } else {
-        alert(`Automation failed: ${data.error || data.message}`);
+        showNotification(`Automation failed: ${data.error || data.message}`, 'error');
       }
     } catch (error) {
       console.error('Error running automation:', error);
-      alert('Error running automation. Check console.');
+      showNotification('Error running automation. Check console.', 'error');
     } finally {
       setIsRunningAutomation(false);
     }
   };
 
   const handleSeedData = async () => {
-    if (!confirm('This will add 3 test members and 3 test payments (Upcoming, Overdue, and Paid). Continue?')) return;
-    setIsSeedingData(true);
-    try {
-      const batch = writeBatch(db);
-      const today = new Date();
-      
-      // Member 1: Active, Upcoming payment in 2 days
-      const m1Ref = doc(collection(db, 'members'));
-      batch.set(m1Ref, {
-        name: 'Test Member (Upcoming)',
-        phone: '911234567890',
-        join_date: format(addDays(today, -30), 'yyyy-MM-dd'),
-        plan: 'monthly',
-        fee_amount: 1000,
-        status: 'active'
-      });
-      
-      const p1Ref = doc(collection(db, 'payments'));
-      batch.set(p1Ref, {
-        member_id: m1Ref.id,
-        amount: 1000,
-        due_date: format(addDays(today, 2), 'yyyy-MM-dd'),
-        status: 'pending'
-      });
+    if (!user) return;
+    setConfirmModal({
+      title: 'Seed Test Data',
+      message: 'This will add 3 test members and 3 test payments (Upcoming, Overdue, and Paid). Continue?',
+      onConfirm: async () => {
+        setIsSeedingData(true);
+        try {
+          const batch = writeBatch(db);
+          const today = new Date();
+          
+          // Member 1: Active, Upcoming payment in 2 days
+          const m1Ref = doc(collection(db, 'users', user.uid, 'members'));
+          batch.set(m1Ref, {
+            name: 'Test Member (Upcoming)',
+            phone: '911234567890',
+            join_date: format(addDays(today, -30), 'yyyy-MM-dd'),
+            plan: 'monthly',
+            fee_amount: 1000,
+            status: 'active'
+          });
+          
+          const p1Ref = doc(collection(db, 'users', user.uid, 'payments'));
+          batch.set(p1Ref, {
+            member_id: m1Ref.id,
+            amount: 1000,
+            due_date: format(addDays(today, 2), 'yyyy-MM-dd'),
+            status: 'pending'
+          });
 
-      // Member 2: Active, Overdue payment (3 days ago)
-      const m2Ref = doc(collection(db, 'members'));
-      batch.set(m2Ref, {
-        name: 'Test Member (Overdue)',
-        phone: '910987654321',
-        join_date: format(addDays(today, -60), 'yyyy-MM-dd'),
-        plan: 'monthly',
-        fee_amount: 1200,
-        status: 'active'
-      });
-      
-      const p2Ref = doc(collection(db, 'payments'));
-      batch.set(p2Ref, {
-        member_id: m2Ref.id,
-        amount: 1200,
-        due_date: format(addDays(today, -3), 'yyyy-MM-dd'),
-        status: 'pending'
-      });
+          // Member 2: Active, Overdue payment (3 days ago)
+          const m2Ref = doc(collection(db, 'users', user.uid, 'members'));
+          batch.set(m2Ref, {
+            name: 'Test Member (Overdue)',
+            phone: '910987654321',
+            join_date: format(addDays(today, -60), 'yyyy-MM-dd'),
+            plan: 'monthly',
+            fee_amount: 1200,
+            status: 'active'
+          });
+          
+          const p2Ref = doc(collection(db, 'users', user.uid, 'payments'));
+          batch.set(p2Ref, {
+            member_id: m2Ref.id,
+            amount: 1200,
+            due_date: format(addDays(today, -3), 'yyyy-MM-dd'),
+            status: 'pending'
+          });
 
-      // Member 3: Active, Paid payment
-      const m3Ref = doc(collection(db, 'members'));
-      batch.set(m3Ref, {
-        name: 'Test Member (Paid)',
-        phone: '915556667777',
-        join_date: format(addDays(today, -15), 'yyyy-MM-dd'),
-        plan: 'monthly',
-        fee_amount: 800,
-        status: 'active'
-      });
-      
-      const p3Ref = doc(collection(db, 'payments'));
-      batch.set(p3Ref, {
-        member_id: m3Ref.id,
-        amount: 800,
-        due_date: format(today, 'yyyy-MM-dd'),
-        payment_date: format(today, 'yyyy-MM-dd'),
-        status: 'paid'
-      });
+          // Member 3: Active, Paid payment
+          const m3Ref = doc(collection(db, 'users', user.uid, 'members'));
+          batch.set(m3Ref, {
+            name: 'Test Member (Paid)',
+            phone: '915556667777',
+            join_date: format(addDays(today, -15), 'yyyy-MM-dd'),
+            plan: 'monthly',
+            fee_amount: 800,
+            status: 'active'
+          });
+          
+          const p3Ref = doc(collection(db, 'users', user.uid, 'payments'));
+          batch.set(p3Ref, {
+            member_id: m3Ref.id,
+            amount: 800,
+            due_date: format(today, 'yyyy-MM-dd'),
+            payment_date: format(today, 'yyyy-MM-dd'),
+            status: 'paid'
+          });
 
-      await batch.commit();
-      alert('Test data seeded successfully!');
-    } catch (error) {
-      console.error('Error seeding data:', error);
-      alert('Error seeding data. Check console.');
-    } finally {
-      setIsSeedingData(false);
-    }
+          await batch.commit();
+          showNotification('Test data seeded successfully!', 'success');
+        } catch (error) {
+          console.error('Error seeding data:', error);
+          showNotification('Error seeding data. Check console.', 'error');
+        } finally {
+          setIsSeedingData(false);
+          setConfirmModal(null);
+        }
+      }
+    });
   };
 
   const handleUpdateSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!settings) return;
+    if (!settings || !user) return;
     setIsSavingSettings(true);
     try {
-      await setDoc(doc(db, 'settings', 'config'), settings);
+      await setDoc(doc(db, 'users', user.uid, 'settings', 'config'), settings);
+      showNotification('Settings updated successfully!', 'success');
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, 'settings/config');
+      handleFirestoreError(err, OperationType.UPDATE, `users/${user.uid}/settings/config`);
     } finally {
       setIsSavingSettings(false);
     }
   };
 
-  const handleDeleteMember = async (id: string) => {
-    if (confirm("Are you sure you want to delete this member?")) {
-      try {
-        await deleteDoc(doc(db, 'members', id));
-        // Also delete their payments
-        const q = query(collection(db, 'payments'), where('member_id', '==', id));
-        const pSnaps = await getDocs(q);
-        const batch = writeBatch(db);
-        pSnaps.docs.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-      } catch (err) {
-        handleFirestoreError(err, OperationType.DELETE, `members/${id}`);
-      }
+  const handleTestWebhook = async () => {
+    const rawUrl = settings?.whatsapp_webhook_url || '';
+    const trimmedUrl = rawUrl.trim();
+    
+    if (!trimmedUrl) {
+      showNotification("Please enter a webhook URL first", 'error');
+      return;
     }
+
+    const isTestUrl = trimmedUrl.includes('/webhook-test/');
+    
+    try {
+      const response = await fetch('/api/proxy-webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: trimmedUrl,
+          data: {
+            type: 'test_connection',
+            member_name: 'Test User',
+            phone: '911234567890',
+            message: 'This is a test message from your Gym Management App!',
+            timestamp: new Date().toISOString()
+          }
+        })
+      });
+      
+      const data = await response.json();
+      if (data.success) {
+        showNotification("Test webhook sent successfully!", 'success');
+      } else {
+        // Try to extract the message from n8n's JSON response
+        let n8nMessage = data.error;
+        try {
+          // If data.error is "HTTP 404: {...}", extract the JSON part
+          const jsonPart = data.error.split(': ').slice(1).join(': ');
+          const parsed = JSON.parse(jsonPart);
+          if (parsed.message) n8nMessage = parsed.message;
+        } catch (e) {
+          // Fallback to original error string
+        }
+
+        let errorMsg = `n8n Error: ${n8nMessage}`;
+        if (isTestUrl && (data.error.includes('404') || n8nMessage.includes('not registered'))) {
+          errorMsg = "n8n is not listening. Click 'Execute Workflow' in n8n first!";
+        }
+        
+        console.error(`Webhook failed for URL: ${data.attemptedUrl}`, data.error);
+        showNotification(errorMsg, 'error');
+      }
+    } catch (error) {
+      console.error('Error sending test webhook:', error);
+      showNotification("Error sending test webhook. Check console.", 'error');
+    }
+  };
+
+  const handleDeleteMember = async (id: string) => {
+    if (!user) return;
+    setConfirmModal({
+      title: 'Delete Member',
+      message: 'Are you sure you want to delete this member? All their payment records will also be deleted.',
+      onConfirm: async () => {
+        try {
+          await deleteDoc(doc(db, 'users', user.uid, 'members', id));
+          // Also delete their payments
+          const q = query(collection(db, 'users', user.uid, 'payments'), where('member_id', '==', id));
+          const pSnaps = await getDocs(q);
+          const batch = writeBatch(db);
+          pSnaps.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          showNotification('Member deleted successfully!', 'success');
+        } catch (err) {
+          handleFirestoreError(err, OperationType.DELETE, `users/${user.uid}/members/${id}`);
+        } finally {
+          setConfirmModal(null);
+        }
+      }
+    });
+  };
+
+  const handleCleanDuplicates = async () => {
+    if (!user) return;
+    setConfirmModal({
+      title: 'Clean Duplicate Data',
+      message: 'This will find members with duplicate phone numbers and duplicate payments for the same month, keeping only the most recent records. Continue?',
+      onConfirm: async () => {
+        try {
+          const batch = writeBatch(db);
+          let deletedMembersCount = 0;
+          let deletedPaymentsCount = 0;
+
+          // 1. Clean Duplicate Members
+          const phoneGroups: { [phone: string]: Member[] } = {};
+          members.forEach(m => {
+            if (!phoneGroups[m.phone]) phoneGroups[m.phone] = [];
+            phoneGroups[m.phone].push(m);
+          });
+
+          for (const phone in phoneGroups) {
+            const group = phoneGroups[phone];
+            if (group.length > 1) {
+              group.sort((a, b) => parseISO(b.join_date).getTime() - parseISO(a.join_date).getTime());
+              const toDelete = group.slice(1);
+              for (const m of toDelete) {
+                batch.delete(doc(db, 'users', user.uid, 'members', m.id));
+                const q = query(collection(db, 'users', user.uid, 'payments'), where('member_id', '==', m.id));
+                const pSnaps = await getDocs(q);
+                pSnaps.docs.forEach(d => batch.delete(d.ref));
+                deletedMembersCount++;
+              }
+            }
+          }
+
+          // 2. Clean Duplicate Payments for remaining members
+          const memberPaymentGroups: { [memberId: string]: { [dueDate: string]: Payment[] } } = {};
+          payments.forEach(p => {
+            if (!memberPaymentGroups[p.member_id]) memberPaymentGroups[p.member_id] = {};
+            if (!memberPaymentGroups[p.member_id][p.due_date]) memberPaymentGroups[p.member_id][p.due_date] = [];
+            memberPaymentGroups[p.member_id][p.due_date].push(p);
+          });
+
+          for (const mId in memberPaymentGroups) {
+            for (const dDate in memberPaymentGroups[mId]) {
+              const group = memberPaymentGroups[mId][dDate];
+              if (group.length > 1) {
+                // Keep the one that is 'paid' if any, otherwise keep the first one
+                group.sort((a, b) => (a.status === 'paid' ? -1 : 1));
+                const toDelete = group.slice(1);
+                for (const p of toDelete) {
+                  batch.delete(doc(db, 'users', user.uid, 'payments', p.id));
+                  deletedPaymentsCount++;
+                }
+              }
+            }
+          }
+
+          if (deletedMembersCount > 0 || deletedPaymentsCount > 0) {
+            await batch.commit();
+            showNotification(`Cleaned ${deletedMembersCount} duplicate members and ${deletedPaymentsCount} duplicate payments.`, 'success');
+          } else {
+            showNotification('No duplicate records found.', 'info');
+          }
+        } catch (err) {
+          console.error('Error cleaning duplicates:', err);
+          showNotification('Error cleaning duplicates.', 'error');
+        } finally {
+          setConfirmModal(null);
+        }
+      }
+    });
   };
 
   const fetchMemberHistory = async (member: Member) => {
@@ -684,7 +1012,7 @@ function AppContent() {
   };
 
   const handleBulkMarkPaid = async () => {
-    if (selectedPayments.length === 0) return;
+    if (selectedPayments.length === 0 || !user) return;
     
     try {
       const batch = writeBatch(db);
@@ -694,7 +1022,7 @@ function AppContent() {
         const pData = payments.find(p => p.id === id);
         if (!pData) continue;
 
-        const paymentRef = doc(db, 'payments', id);
+        const paymentRef = doc(db, 'users', user.uid, 'payments', id);
         batch.update(paymentRef, {
           status: 'paid',
           payment_date: paymentDate
@@ -708,7 +1036,7 @@ function AppContent() {
         if (mData.plan === 'yearly') monthsToAdd = 12;
         
         const nextDueDate = format(addMonths(parseISO(pData.due_date), monthsToAdd), 'yyyy-MM-dd');
-        const nextPaymentRef = doc(collection(db, 'payments'));
+        const nextPaymentRef = doc(collection(db, 'users', user.uid, 'payments'));
         batch.set(nextPaymentRef, {
           member_id: mData.id,
           amount: mData.fee_amount,
@@ -720,7 +1048,7 @@ function AppContent() {
       await batch.commit();
       setSelectedPayments([]);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'bulk-pay');
+      handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}/bulk-pay`);
     }
   };
 
@@ -736,6 +1064,87 @@ function AppContent() {
     } else {
       setSelectedPayments(ids);
     }
+  };
+
+  const PaymentModal = () => {
+    if (!paymentModal.isOpen || !paymentModal.payment) return null;
+    const p = paymentModal.payment;
+    const memberName = memberNames[p.member_id] || 'Unknown Member';
+    
+    const upiUrl = settings?.upi_id 
+      ? `upi://pay?pa=${settings.upi_id}&pn=GymFlow&am=${p.amount}&cu=INR&tn=GymFee_${p.due_date}`
+      : null;
+
+    return (
+      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+        <motion.div 
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="bg-white rounded-3xl shadow-2xl max-w-md w-full overflow-hidden"
+        >
+          <div className="p-6 border-b border-gray-100 flex justify-between items-center bg-indigo-600 text-white">
+            <h3 className="text-xl font-bold">Collect Payment</h3>
+            <button onClick={() => setPaymentModal({ isOpen: false, payment: null })} className="p-2 hover:bg-white/20 rounded-full transition-all">
+              <X className="w-6 h-6" />
+            </button>
+          </div>
+          
+          <div className="p-8 space-y-6">
+            <div className="text-center">
+              <p className="text-sm text-gray-500 uppercase font-bold tracking-wider mb-1">Amount Due</p>
+              <h2 className="text-4xl font-black text-gray-900">₹{p.amount}</h2>
+              <p className="text-sm text-indigo-600 font-bold mt-2">{memberName}</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <button 
+                onClick={() => {
+                  handleMarkPaid(p.id, 'cash');
+                  setPaymentModal({ isOpen: false, payment: null });
+                  showNotification('Payment collected via Cash', 'success');
+                }}
+                className="flex flex-col items-center gap-3 p-6 rounded-2xl border-2 border-gray-100 hover:border-indigo-600 hover:bg-indigo-50 transition-all group"
+              >
+                <div className="w-12 h-12 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600 group-hover:scale-110 transition-transform">
+                  <CreditCard className="w-6 h-6" />
+                </div>
+                <span className="font-bold text-gray-700">Cash</span>
+              </button>
+
+              {upiUrl ? (
+                <button 
+                  onClick={() => {
+                    handleMarkPaid(p.id, 'upi');
+                    setPaymentModal({ isOpen: false, payment: null });
+                    showNotification('Payment collected via UPI', 'success');
+                  }}
+                  className="flex flex-col items-center gap-3 p-6 rounded-2xl border-2 border-gray-100 hover:border-indigo-600 hover:bg-indigo-50 transition-all group"
+                >
+                  <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 group-hover:scale-110 transition-transform">
+                    <TrendingUp className="w-6 h-6" />
+                  </div>
+                  <span className="font-bold text-gray-700">UPI</span>
+                </button>
+              ) : (
+                <div className="flex flex-col items-center justify-center p-6 rounded-2xl border-2 border-dashed border-gray-200 opacity-50">
+                   <span className="text-[10px] font-bold text-gray-400 text-center">Setup UPI in Settings to enable</span>
+                </div>
+              )}
+            </div>
+
+            {upiUrl && (
+              <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100 text-center">
+                <p className="text-[10px] font-bold text-gray-400 uppercase mb-4">Scan to Pay (UPI)</p>
+                <div className="bg-white p-4 rounded-xl inline-block border border-gray-100 shadow-sm">
+                   <QRCodeSVG value={upiUrl} size={160} />
+                </div>
+                <p className="text-[10px] text-gray-500 mt-4 font-medium">UPI ID: {settings?.upi_id}</p>
+              </div>
+            )}
+          </div>
+        </motion.div>
+      </div>
+    );
   };
 
   if (!isAuthReady) {
@@ -852,6 +1261,7 @@ function AppContent() {
 
       {/* Main Content */}
       <main className="flex-1 p-4 md:p-8 overflow-y-auto pb-24 md:pb-8 bg-gray-50/50">
+        <PaymentModal />
         <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6 mb-8 md:mb-10">
           <div className="w-full md:w-auto">
             {view === 'dashboard' ? (
@@ -1024,7 +1434,7 @@ function AppContent() {
                             <p className="font-bold text-gray-900">₹{p.amount}</p>
                             <div className="flex items-center gap-3">
                               <button 
-                                onClick={() => handleMarkPaid(p.id)}
+                                onClick={() => setPaymentModal({ isOpen: true, payment: p })}
                                 className="text-xs text-indigo-600 font-bold hover:underline"
                               >
                                 Mark as Paid
@@ -1136,7 +1546,7 @@ function AppContent() {
                         <td className="px-6 py-4">
                           <div className="flex flex-col gap-1">
                             {m.status_history?.slice(-3).reverse().map((h, i) => (
-                              <div key={i} className="flex items-center gap-2 text-[10px]">
+                              <div key={`${h.date}-${h.status}-${i}`} className="flex items-center gap-2 text-[10px]">
                                 <span className={`w-1.5 h-1.5 rounded-full ${h.status === 'active' ? 'bg-green-500' : 'bg-red-500'}`} />
                                 <span className="text-gray-600 font-medium capitalize">{h.status}</span>
                                 <span className="text-gray-400">({format(parseISO(h.date), 'dd-MM')})</span>
@@ -1216,7 +1626,7 @@ function AppContent() {
                       <p className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-2">Status History</p>
                       <div className="flex flex-wrap gap-2">
                         {m.status_history?.slice(-3).reverse().map((h, i) => (
-                          <div key={i} className="flex items-center gap-1.5 bg-gray-50 px-2 py-1 rounded-lg text-[10px]">
+                          <div key={`${h.date}-${h.status}-${i}`} className="flex items-center gap-1.5 bg-gray-50 px-2 py-1 rounded-lg text-[10px]">
                             <span className={`w-1 h-1 rounded-full ${h.status === 'active' ? 'bg-green-500' : 'bg-red-500'}`} />
                             <span className="text-gray-600 font-bold capitalize">{h.status}</span>
                             <span className="text-gray-400">{format(parseISO(h.date), 'dd-MM')}</span>
@@ -1253,6 +1663,29 @@ function AppContent() {
                     </div>
                   </div>
                 ))}
+              </div>
+
+              {/* Pagination Controls */}
+              <div className="flex items-center justify-between mt-6 bg-white p-4 rounded-2xl border border-gray-100 shadow-sm">
+                <p className="text-sm text-gray-500 font-medium">
+                  Showing page <span className="font-bold text-gray-900">{membersPage}</span>
+                </p>
+                <div className="flex gap-2">
+                  <button 
+                    onClick={handlePrevMembers}
+                    disabled={membersPage === 1}
+                    className="px-4 py-2 rounded-xl text-sm font-bold border border-gray-200 disabled:opacity-50 hover:bg-gray-50 transition-all"
+                  >
+                    Previous
+                  </button>
+                  <button 
+                    onClick={handleNextMembers}
+                    disabled={members.length < membersPageSize}
+                    className="px-4 py-2 rounded-xl text-sm font-bold bg-indigo-600 text-white disabled:opacity-50 hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
             </motion.div>
           )}
@@ -1376,7 +1809,7 @@ function AppContent() {
                             {p.status === 'pending' && (
                               <>
                                 <button 
-                                  onClick={() => handleMarkPaid(p.id)}
+                                  onClick={() => setPaymentModal({ isOpen: true, payment: p })}
                                   className="bg-indigo-600 text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-indigo-700 transition-all"
                                 >
                                   Mark Paid
@@ -1438,7 +1871,7 @@ function AppContent() {
                     {p.status === 'pending' && (
                       <div className="flex gap-3">
                         <button 
-                          onClick={() => handleMarkPaid(p.id)}
+                          onClick={() => setPaymentModal({ isOpen: true, payment: p })}
                           className="flex-1 bg-indigo-600 text-white py-3 rounded-xl text-sm font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 touch-manipulation"
                         >
                           Mark as Paid
@@ -1453,6 +1886,29 @@ function AppContent() {
                     )}
                   </div>
                 ))}
+              </div>
+
+              {/* Pagination Controls */}
+              <div className="flex items-center justify-between mt-6 bg-white p-4 rounded-2xl border border-gray-100 shadow-sm">
+                <p className="text-sm text-gray-500 font-medium">
+                  Showing page <span className="font-bold text-gray-900">{paymentsPage}</span>
+                </p>
+                <div className="flex gap-2">
+                  <button 
+                    onClick={handlePrevPayments}
+                    disabled={paymentsPage === 1}
+                    className="px-4 py-2 rounded-xl text-sm font-bold border border-gray-200 disabled:opacity-50 hover:bg-gray-50 transition-all"
+                  >
+                    Previous
+                  </button>
+                  <button 
+                    onClick={handleNextPayments}
+                    disabled={payments.length < paymentsPageSize}
+                    className="px-4 py-2 rounded-xl text-sm font-bold bg-indigo-600 text-white disabled:opacity-50 hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
 
               {/* Bulk Action Bar */}
@@ -1632,9 +2088,79 @@ function AppContent() {
                       </button>
                     </div>
                   </div>
+
+                  <div className="pt-6 border-t border-gray-100">
+                    <div className="flex items-center gap-2 mb-4">
+                      <div className="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center">
+                        <TrendingUp className="w-4 h-4 text-blue-600" />
+                      </div>
+                      <h4 className="text-sm font-bold text-gray-900">Payment Gateway Settings</h4>
+                    </div>
+                    <label className="block text-xs md:text-sm font-bold text-gray-700 mb-2">
+                      Your UPI ID (for QR Code)
+                    </label>
+                    <input 
+                      type="text" 
+                      className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-indigo-500 outline-none text-base"
+                      value={settings.upi_id || ''}
+                      onChange={e => setSettings({...settings, upi_id: e.target.value})}
+                      placeholder="e.g. yourname@upi"
+                    />
+                    <p className="mt-2 text-[10px] md:text-xs text-gray-500">
+                      Providing a UPI ID enables the QR code payment option when collecting fees.
+                    </p>
+                  </div>
+
+                  <div className="pt-6 border-t border-gray-100">
+                    <div className="flex items-center gap-2 mb-4">
+                      <div className="w-8 h-8 bg-green-50 rounded-lg flex items-center justify-center">
+                        <Phone className="w-4 h-4 text-green-600" />
+                      </div>
+                      <h4 className="text-sm font-bold text-gray-900">n8n WhatsApp Integration</h4>
+                    </div>
+                    <label className="block text-xs md:text-sm font-bold text-gray-700 mb-2">
+                      n8n Webhook URL
+                    </label>
+                    <input 
+                      type="url" 
+                      className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-indigo-500 outline-none text-base"
+                      value={settings.whatsapp_webhook_url || ''}
+                      onChange={e => setSettings({...settings, whatsapp_webhook_url: e.target.value})}
+                      placeholder="https://your-n8n-instance.com/webhook/..."
+                    />
+                    <div className="mt-3 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={handleTestWebhook}
+                        className="text-xs font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1 bg-indigo-50 px-3 py-2 rounded-lg transition-all"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        Send Test Webhook to n8n
+                      </button>
+                    </div>
+                    <p className="mt-2 text-[10px] md:text-xs text-gray-500">
+                      If provided, automation will send a POST request to this URL with member details and message.
+                    </p>
+                  </div>
                 </div>
 
-                <div className="pt-4 flex justify-end">
+                <div className="pt-4 flex flex-col sm:flex-row justify-end gap-3">
+                  <button 
+                    type="button"
+                    onClick={handleCleanDuplicates}
+                    className="w-full md:w-auto bg-amber-50 text-amber-700 px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-amber-100 transition-all touch-manipulation"
+                  >
+                    <RefreshCw className="w-5 h-5" />
+                    Clean Duplicates
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={handleSeedData}
+                    className="w-full md:w-auto bg-indigo-50 text-indigo-700 px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-100 transition-all touch-manipulation"
+                  >
+                    <Plus className="w-5 h-5" />
+                    Seed Test Data
+                  </button>
                   <button 
                     type="submit"
                     disabled={isSavingSettings}
@@ -1965,6 +2491,63 @@ function AppContent() {
           </motion.div>
         </div>
       )}
+      {/* Notifications */}
+      <AnimatePresence>
+        {notification && (
+          <motion.div
+            initial={{ opacity: 0, y: 50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 50 }}
+            className={`fixed bottom-6 right-6 z-[100] px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 border ${
+              notification.type === 'success' ? 'bg-green-50 border-green-100 text-green-800' :
+              notification.type === 'error' ? 'bg-red-50 border-red-100 text-red-800' :
+              'bg-blue-50 border-blue-100 text-blue-800'
+            }`}
+          >
+            {notification.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> :
+             notification.type === 'error' ? <AlertCircle className="w-5 h-5" /> :
+             <Bell className="w-5 h-5" />}
+            <span className="font-bold text-sm">{notification.message}</span>
+            <button onClick={() => setNotification(null)} className="ml-2 hover:opacity-70">
+              <X className="w-4 h-4" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Confirmation Modal */}
+      <AnimatePresence>
+        {confirmModal && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl"
+            >
+              <div className="w-16 h-16 bg-amber-50 rounded-2xl flex items-center justify-center mb-6">
+                <AlertTriangle className="w-8 h-8 text-amber-600" />
+              </div>
+              <h3 className="text-2xl font-black text-gray-900 mb-2">{confirmModal.title}</h3>
+              <p className="text-gray-600 mb-8 leading-relaxed font-medium">{confirmModal.message}</p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setConfirmModal(null)}
+                  className="flex-1 px-6 py-4 rounded-2xl font-bold text-gray-500 hover:bg-gray-100 transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={confirmModal.onConfirm}
+                  className="flex-1 px-6 py-4 rounded-2xl font-bold bg-red-600 text-white hover:bg-red-700 transition-all shadow-lg shadow-red-100"
+                >
+                  Confirm
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
